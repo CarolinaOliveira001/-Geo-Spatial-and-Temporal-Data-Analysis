@@ -1,0 +1,444 @@
+\\Opening the jar falies
+spark-shell --jars /home/elnaz/Documents/nosql/bigdata2/jars/geojson2esri.jar,/home/elnaz/Documents/nosql/bigdata2/jars/spray-json_2.12-1.3.6.jar,/home/elnaz/Documents/nosql/bigdata2/jars/nscala-time_2.12-2.30.0.jar,/home/elnaz/Documents/nosql/bigdata2/jars/joda-time-2.9.9.jar,/home/elnaz/Documents/nosql/bigdata2/jars/esri-geometry-api-1.2.1.jar
+
+\\Importing the libraries
+import com.esri.core.geometry.{ GeometryEngine, SpatialReference, Geometry, Point }
+import com.github.nscala_time.time.Imports.{ DateTime, Duration }
+
+import GeoJsonProtocol._ // this contains our custom GeoJson types
+
+import java.text.SimpleDateFormat
+
+import org.apache.spark.{ HashPartitioner, Partitioner }
+import org.apache.spark.rdd.RDD
+import org.apache.spark.{ SparkConf, SparkContext }
+import org.apache.spark.util.StatCounter
+
+import scala.collection.mutable.ArrayBuffer
+import scala.reflect.ClassTag
+
+import spray.json._
+val conf = new SparkConf()
+  .setMaster("local")
+  .setAppName("RunTaxiTrips")
+
+sc.setLogLevel("ERROR")
+
+val formatter = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+
+def point(longitude: String, latitude: String): Point = {
+  new Point(longitude.toDouble, latitude.toDouble)
+}
+
+case class TaxiTrip (
+  pickupTime:  org.joda.time.DateTime,
+  dropoffTime: org.joda.time.DateTime,
+  pickupLoc:   com.esri.core.geometry.Point,
+  dropoffLoc:  com.esri.core.geometry.Point) extends java.io.Serializable
+
+def parse(line: String): (String, TaxiTrip) = {
+  val fields = line.split(',')
+  val license = fields(1)
+  val pickupTime = new org.joda.time.DateTime(formatter.parse(fields(5)))
+  val dropoffTime = new org.joda.time.DateTime(formatter.parse(fields(6)))
+  val pickupLoc = point(fields(10), fields(11))
+  val dropoffLoc = point(fields(12), fields(13))
+  val trip = TaxiTrip(pickupTime, dropoffTime, pickupLoc, dropoffLoc)
+  (license, trip)
+}
+
+def safe[S, T](f: S => T): S => Either[T, (S, Exception)] = {
+  new Function[S, Either[T, (S, Exception)]] with Serializable {
+    def apply(s: S): Either[T, (S, Exception)] = {
+      try {
+        Left(f(s))
+      } catch {
+        case e: Exception => Right((s, e))
+      }
+    }
+  }
+}
+
+val taxiRaw = sc.textFile("/home/elnaz/Documents/nosql/bigdata2/nyc-taxi-trips").sample(false, 0.01)
+val taxiParsed = taxiRaw.map(safe(parse))
+taxiParsed.cache()
+
+val taxiBad = taxiParsed.collect({
+  case t if t.isRight => t.right.get
+})
+
+val taxiGood = taxiParsed.collect({
+  case t if t.isLeft => t.left.get
+})
+taxiGood.cache() 
+
+println("\n" + taxiGood.count() + " taxi trips parsed.")
+println(taxiBad.count() + " taxi trips dropped.")
+
+def getHours(trip: TaxiTrip): Long = {
+  val d = new Duration(
+    trip.pickupTime,
+    trip.dropoffTime)
+  d.getStandardHours
+}
+
+println("\nDistribution of trip durations in hours:")
+taxiGood.values.map(getHours).countByValue().
+  toList.sorted.foreach(println)
+
+val taxiClean = taxiGood.filter {
+  case (lic, trip) =>
+    val hrs = getHours(trip)
+    0 <= hrs && hrs < 3
+}
+
+val taxiDone = taxiClean.filter {
+  case (lic, trip) =>
+    val zero = new Point(0.0, 0.0)
+    !(zero.equals(trip.pickupLoc) || zero.equals(trip.dropoffLoc))
+}
+taxiDone.cache()
+
+val geojson = scala.io.Source.
+  fromFile("/home/elnaz/Documents/nosql/bigdata2/nyc-borough-boundaries-polygon.geojson").mkString
+  
+val features = geojson.parseJson.convertTo[FeatureCollection]
+
+val p = new Point(-73.994499, 40.75066)
+val b = features.find(f => f.geometry.contains(p))
+
+val areaSortedFeatures = features.sortBy(f => {
+  val borough = f("boroughCode").convertTo[Int]
+  (borough, -f.geometry.area2D())
+})
+
+val bFeatures = sc.broadcast(areaSortedFeatures)
+
+def borough(trip: TaxiTrip): Option[String] = {
+  val feature: Option[Feature] = bFeatures.value.find(f => {
+    f.geometry.contains(trip.dropoffLoc)
+  })
+  feature.map(f => {
+    f("borough").convertTo[String]
+  })
+}
+
+println("\nDistribution of trips per borough:")
+taxiClean.values.map(borough).countByValue().foreach(println)
+
+taxiClean.values.filter(t => borough(t).isEmpty).
+take(10).foreach(println)
+
+\\Defining a function get minutes to have the duration of the trips in minutes
+def getMins(trip: TaxiTrip) = {
+  val d = new Duration(
+    trip.pickupTime,
+    trip.dropoffTime)
+  d.getStandardMinutes}
+  
+\\a  
+\\I defined 2 functions to find the boroughs, one for pickup(called boroughstart) and one for dropoff(called boroughend) 
+def boroughstart(trip: TaxiTrip): Option[String] = {
+val feature: Option[Feature] = bFeatures.value.find(f => {
+f.geometry.contains(trip.pickupLoc) })
+feature.map(f => {
+f("borough").convertTo[String]
+})}
+
+def boroughend(trip: TaxiTrip): Option[String] = {
+val feature: Option[Feature] = bFeatures.value.find(f => {
+f.geometry.contains(trip.dropoffLoc) })
+feature.map(f => {
+f("borough").convertTo[String]
+})}
+
+\\Find the boroughstart and boroughend for all of the taxiClean values.Then I indexed the taxiclean because later I have to join them with borough end and start
+val start = taxiClean.values.flatMap(boroughstart).zipWithIndex.map(_.swap)
+val end = taxiClean.values.flatMap(boroughend).zipWithIndex.map(_.swap)
+
+\\same boroughs
+\\For the same borough first I joined the start and end boroughs and then I filtered the ones which has the same first and second elements and then I joined it with
+\\taxiClean.After I found the duration of those taxi trips with getHours function, and find the count, sum, mean.
+val z1 = start.join(end).sortByKey().filter(x => x._2._1 == x._2._2)
+val taxi = taxiClean.zipWithIndex().map(_.swap)
+val sameborough = z1.join(taxi).sortByKey()
+val s1 = sameborough.values.map(x => x._2._2)
+val mins1 = s1.map(getMins)
+val count1 = mins1.count
+val sum1 = mins1.sum
+val mean1 = mins1.mean
+
+\\b
+\\different boroughs
+\\The same as above but this time because we need different boroughs so we filter those with boroughs which are not the same
+val z2 = start.join(end).sortByKey().filter(x => x._2._1 != x._2._2)
+val taxi = taxiClean.zipWithIndex().map(_.swap)
+val diffborough = z2.join(taxi).sortByKey()
+val s2 = diffborough.values.map(x => x._2._2)
+val mins2 = s2.map(getMins)
+val count1 = mins2.count
+val sum1 = mins2.sum
+val mean1 = mins2.mean
+
+\\c
+\\repeat a for each borough
+\\I used a groupby borough to find the count, average, sum for each borough
+
+\\sum
+val z3 = start.join(end).sortByKey().filter(x => x._2._1 == x._2._2)
+val taxi = taxiClean.zipWithIndex().map(_.swap)
+val sameborough = z1.join(taxi).sortByKey()
+val s3 = sameborough.values.map(x => x._2._2)
+val mins3 = s3.map(x => (boroughstart(x), getMins(x)))
+mins3.mapValues( d => {val s = new StatCounter()
+         s.merge(d)}).reduceByKey((a,b) => a.merge(b)).collect().foreach( x => println(x._1, x._2.sum))
+
+\\count
+s3.map(boroughstart).countByValue()
+
+
+\\average 
+mins3.mapValues( d => {val s = new StatCounter()
+         s.merge(d)}).reduceByKey((a,b) => a.merge(b)).collect().foreach( x => println(x._1, x._2.mean))
+
+
+\\Repeat question b for each borough
+\\Different start and end
+\\sum
+val z4 = start.join(end).sortByKey().filter(x => x._2._1 != x._2._2)
+val taxi = taxiClean.zipWithIndex().map(_.swap)
+val diffborough = z4.join(taxi).sortByKey()
+val s4 = diffborough.values.map(x => x._2._2)
+val mins4 = s4.map(x => (boroughstart(x), getMins(x)))
+mins4.mapValues( d => {val s = new StatCounter()
+         s.merge(d)}).reduceByKey((a,b) => a.merge(b)).collect().foreach( x => println(x._1, x._2.sum))
+
+\\count
+s4.map(boroughstart).countByValue()
+
+\\average    
+mins4.mapValues( d => {val s = new StatCounter()
+         s.merge(d)}).reduceByKey((a,b) => a.merge(b)).collect().foreach( x => println(x._1, x._2.mean))
+\\In both same and different start and end boroughs, Queens was the busiest. 
+
+\\d
+\\Find the days of week 
+\\This time I found the days of the weeks with getDayOfWeek() and then I grouped by them.
+\\Again here I did it for the same boroughs and different boroughs. Thursday is the busiest week day.
+
+\\Defining a function to get the day of the week for each taxitrip
+\\same boroughs
+def weekday(trip: TaxiTrip) = { 
+val weekd = trip.pickupTime.getDayOfWeek()
+weekd}
+
+
+\\count
+val z5 = start.join(end).sortByKey().filter(x => x._2._1 == x._2._2)
+val taxi = taxiClean.zipWithIndex().map(_.swap)
+val sameborough = z5.join(taxi).sortByKey()
+val s5 = sameborough.values.map(x => x._2._2)
+val mins5 = s5.map(x => (weekday(x), getMins(x)))
+mins5.mapValues( d => {val s = new StatCounter()
+         s.merge(d)}).reduceByKey((a,b) => a.merge(b)).collect().foreach( x => println(x._1, x._2.count))
+\\sum
+mins5.mapValues( d => {val s = new StatCounter()
+         s.merge(d)}).reduceByKey((a,b) => a.merge(b)).collect().foreach( x => println(x._1, x._2.sum))
+         
+\\average 
+mins5.mapValues( d => {val s = new StatCounter()
+         s.merge(d)}).reduceByKey((a,b) => a.merge(b)).collect().foreach( x => println(x._1, x._2.mean))   
+
+\\Number 5 has the highest mean, which means Fridays are the busiest days of the week for the same start and end boroughs.
+        
+\\different boroughs
+
+\\count
+val z6 = start.join(end).sortByKey().filter(x => x._2._1 != x._2._2)
+val taxi = taxiClean.zipWithIndex().map(_.swap)
+val diffborough = z6.join(taxi).sortByKey()
+val s6 = diffborough.values.map(x => x._2._2)
+val mins6 = s6.map(x => (weekday(x), getMins(x)))
+mins6.mapValues( d => {val s = new StatCounter()
+         s.merge(d)}).reduceByKey((a,b) => a.merge(b)).collect().foreach( x => println(x._1, x._2.count))
+\\sum
+mins6.mapValues( d => {val s = new StatCounter()
+         s.merge(d)}).reduceByKey((a,b) => a.merge(b)).collect().foreach( x => println(x._1, x._2.sum))
+         
+\\average 
+mins6.mapValues( d => {val s = new StatCounter()
+         s.merge(d)}).reduceByKey((a,b) => a.merge(b)).collect().foreach( x => println(x._1, x._2.mean)) 
+
+\\Also, for different start and end boroughs Fridays are the busiest.
+
+
+
+\\e
+\\For this question we have to make another grouping condition which is the hour of the day to group by borough, first we define the sessions like what we have in the shell
+class FirstKeyPartitioner[K1, K2](partitions: Int) extends org.apache.spark.Partitioner {
+  val delegate = new org.apache.spark.HashPartitioner(partitions)
+  override def numPartitions: Int = delegate.numPartitions
+  override def getPartition(key: Any): Int = {
+    val k = key.asInstanceOf[(K1, K2)]
+    delegate.getPartition(k._1)
+  }
+}
+
+def secondaryKey(trip: TaxiTrip) = trip.pickupTime.getMillis
+
+def split(t1: TaxiTrip, t2: TaxiTrip): Boolean = {
+  val p1 = t1.pickupTime
+  val p2 = t2.pickupTime
+  val d = new Duration(p1, p2)
+  d.getStandardHours >= 4
+}
+
+def groupSorted[K, V, S](
+  it:        Iterator[((K, S), V)],
+  splitFunc: (V, V) => Boolean): Iterator[(K, List[V])] = {
+  val res = List[(K, ArrayBuffer[V])]()
+  it.foldLeft(res)((list, next) => list match {
+    case Nil =>
+      val ((lic, _), trip) = next
+      List((lic, ArrayBuffer(trip)))
+    case cur :: rest =>
+      val (curLic, trips) = cur
+      val ((lic, _), trip) = next
+      if (!lic.equals(curLic) || splitFunc(trips.last, trip)) {
+        (lic, ArrayBuffer(trip)) :: list
+      } else {
+        trips.append(trip)
+        list
+      }
+  }).map { case (lic, buf) => (lic, buf.toList) }.iterator
+}
+
+def groupByKeyAndSortValues[K: Ordering: ClassTag, V: ClassTag, S: Ordering](
+  rdd:              RDD[(K, V)],
+  secondaryKeyFunc: V => S,
+  splitFunc:        (V, V) => Boolean,
+  numPartitions:    Int): RDD[(K, List[V])] = {
+  val presess = rdd.map {
+    case (lic, trip) => ((lic, secondaryKeyFunc(trip)), trip)
+  }
+  val partitioner = new FirstKeyPartitioner[K, S](numPartitions)
+  presess.repartitionAndSortWithinPartitions(partitioner).mapPartitions(groupSorted(_, splitFunc))
+}
+
+val sessions = groupByKeyAndSortValues(taxiDone, secondaryKey, split, 30) // use fixed amount of 30 partitions
+sessions.cache()
+
+println("\nSome sample sessions:")
+sessions.take(5).foreach(println)
+
+
+\\Per borough
+def boroughDuration(t1: TaxiTrip, t2: TaxiTrip) = {
+  val b = borough(t1)
+  val d = new Duration(t1.dropoffTime, t2.pickupTime)
+  (b, d)
+}
+
+val boroughDurations: RDD[(Option[String], Duration)] =
+  sessions.values.flatMap(trips => {
+    val iter: Iterator[Seq[TaxiTrip]] = trips.sliding(2)
+    val viter = iter.filter(_.size == 2)
+    viter.map(p => boroughDuration(p(0), p(1)))
+  }).cache()
+  
+println("\nDistribution of wait-times in hours:")
+boroughDurations.values.map(_.getStandardHours).countByValue().toList.sorted.foreach(println)
+
+println("\nFinal stats of wait-times per borough:")
+boroughDurations.filter {case (b, d) => d.getMillis >= 0}.mapValues(d => {
+  val s = new StatCounter()
+  s.merge(d.getStandardSeconds)
+}).reduceByKey((a, b) => a.merge(b)).collect().foreach(println)
+  
+  
+  
+\\Per hour of the day (Here I made 2 functions to take the boroughs and the hours of the day from the taxi trips. Then I grouped by and found the mean per borough and per hour of 
+\\the day.)
+def hourDuration(t1: TaxiTrip, t2: TaxiTrip) = {
+  val b = borough(t1)
+  val h = t1.pickupTime.getHourOfDay()
+  val d = new Duration(t1.dropoffTime, t2.pickupTime)
+  ((b, h), d.getStandardHours)}  
+  
+val hourDurations=
+  sessions.values.flatMap(trips => {
+    val iter: Iterator[List[TaxiTrip]] = trips.sliding(2)
+    val viter = iter.filter(_.size == 2)
+    viter.map(p => hourDuration(p(0), p(1)))
+  }).cache()
+  
+hourDurations.values.countByValue().toList.sorted.foreach(println)
+
+println("\nFinal stats of wait-times per borough:")
+hourDurations.mapValues(d => {
+  val s = new StatCounter()
+  s.merge(d)
+}).reduceByKey((a, b) => a.merge(b)).collect().foreach(println)
+\\Here the mean shows the average per borough and per hour of the day for each.
+
+
+\\f
+\\Compute duration of each taxi trip in seconds:
+def getSec(trip: TaxiTrip): Long = {
+  val d = new Duration(
+    trip.pickupTime,
+    trip.dropoffTime)
+  d.getStandardSeconds
+}
+val sec = taxiDone.values.zipWithIndex().map(_.swap).map(x => (x._1,getSec(x._2)))
+
+\\Finding the distance with the formula of haversine and applying it on all the points in the taxiClean
+def haversineDistance_single(point:((Double, Double),(Double, Double))) = {
+  val pointB = point._2
+  val pointA = point._1
+  val deltaLat = math.toRadians(pointB._1 - pointA._1)
+  val deltaLong = math.toRadians(pointB._2 - pointA._2)
+  val a = math.pow(math.sin(deltaLat / 2), 2) + math.cos(math.toRadians(pointA._1)) * math.cos(math.toRadians(pointB._1)) * math.pow(math.sin(deltaLong / 2), 2)
+  val greatCircleDistance = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+  3958.761 * greatCircleDistance
+    }
+
+\\We find all the tuples of points in each trip. (by point I mean the x and y coordinates for pickup locations and dropoff location.)
+def points(trip : TaxiTrip)= {
+  val startpoint = (trip.pickupLoc.getX(),trip.pickupLoc.getY())
+  val endpoint = (trip.dropoffLoc.getX(),trip.dropoffLoc.getY())
+  (startpoint,endpoint)}
+
+\\Find the Haversine distance for each point 
+val point = taxiClean.values.map(points)
+val dist = point.zipWithIndex().map(_.swap).map(x => (x._1,haversineDistance_single(x._2)))
+
+\\Divide the seconds by the distance 
+val sec_dist = sec.join(dist).sortByKey()
+val norm = sec_dist.map(x => (x._1, x._2._1/x._2._2))
+val normal = taxiClean.zipWithIndex().map(_.swap).join(norm)
+
+
+def hourOfDay(t1: TaxiTrip) = {
+  val h = t1.pickupTime.getHourOfDay()
+  h}
+  
+val hourday = taxiClean.zipWithIndex().map(_.swap).map(x => (x._1,hourOfDay(x._2._2)))  
+val hn = hourday.join(normal)   
+
+\\Making RDD with only values in 
+val rddfinal = hn.map(x => (x._2._1,x._2._2._2.longValue()))
+
+\\Now its enough to group by the hour of the day and find the statistics.
+\\count
+rddfinal.mapValues( d => {val s = new StatCounter()
+         s.merge(d)}).reduceByKey((a,b) => a.merge(b)).collect().foreach( x => println(x._1, x._2.count))
+         
+\\sum
+rddfinal.mapValues( d => {val s = new StatCounter()
+         s.merge(d)}).reduceByKey((a,b) => a.merge(b)).collect().foreach( x => println(x._1, x._2.sum))
+
+\\mean         
+rddfinal.mapValues( d => {val s = new StatCounter()
+         s.merge(d)}).reduceByKey((a,b) => a.merge(b)).collect().foreach( x => println(x._1, x._2.mean))
+
